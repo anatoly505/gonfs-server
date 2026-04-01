@@ -1,0 +1,36 @@
+# github.com/cyphar/filepath-securejoin v0.3.6
+## explicit; go 1.18
+github.com/cyphar/filepath-securejoin
+# github.com/go-git/go-billy/v5 v5.8.0
+## explicit; go 1.24.0
+github.com/go-git/go-billy/v5
+github.com/go-git/go-billy/v5/helper/chroot
+github.com/go-git/go-billy/v5/helper/polyfill
+github.com/go-git/go-billy/v5/memfs
+github.com/go-git/go-billy/v5/osfs
+github.com/go-git/go-billy/v5/util
+# github.com/google/uuid v1.6.0
+## explicit
+github.com/google/uuid
+# github.com/hashicorp/golang-lru/v2 v2.0.7
+## explicit; go 1.18
+github.com/hashicorp/golang-lru/v2
+github.com/hashicorp/golang-lru/v2/internal
+github.com/hashicorp/golang-lru/v2/simplelru
+# github.com/rasky/go-xdr v0.0.0-20170124162913-1a41d1a06c93
+## explicit
+github.com/rasky/go-xdr/xdr2
+# github.com/willscott/go-nfs v0.0.3
+## explicit; go 1.19
+github.com/willscott/go-nfs
+github.com/willscott/go-nfs/file
+github.com/willscott/go-nfs/helpers
+# github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00
+## explicit; go 1.19
+github.com/willscott/go-nfs-client/nfs/rpc
+github.com/willscott/go-nfs-client/nfs/util
+github.com/willscott/go-nfs-client/nfs/xdr
+# golang.org/x/sys v0.36.0
+## explicit; go 1.24.0
+golang.org/x/sys/unix
+golang.org/x/sys/windows

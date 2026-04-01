@@ -7,6 +7,9 @@ Built for one job: serving large files at maximum throughput. Perfect for 4K UHD
 ## Features
 
 - **NFSv3** protocol — widely supported, stateless, simple
+- **Patched go-nfs core** — vendored with critical performance patches (see below)
+- **Concurrent RPC handling** — up to 32 NFS requests processed in parallel per connection
+- **Zero-alloc read path** — `sync.Pool` for read buffers and response writers, no GC pressure
 - **FD caching** — keeps file descriptors open across NFS READ calls, eliminating ~100k `open()/close()` syscalls per 100 GB file
 - **Stat caching** — configurable TTL, avoids redundant `stat()` on static media files
 - **TCP tuning** — large send/receive buffers, `TCP_NODELAY`, keepalive
@@ -21,11 +24,13 @@ Built for one job: serving large files at maximum throughput. Perfect for 4K UHD
 
 ```bash
 # Linux / macOS
-go build -o gonfs-server .
+go build -mod=vendor -o gonfs-server .
 
 # Windows (cross-compile)
-GOOS=windows GOARCH=amd64 go build -o gonfs-server.exe .
+GOOS=windows GOARCH=amd64 go build -mod=vendor -o gonfs-server.exe .
 ```
+
+> Uses `-mod=vendor` because go-nfs is vendored with performance patches.
 
 ### Run
 
@@ -94,6 +99,27 @@ mount -o port=2049,mountport=2049 -t nfs <server-ip>:/ /mnt/nfs
 └─────────────────────────────────────────────┘
 ```
 
+### Vendored go-nfs patches
+
+The upstream `go-nfs` library has several performance bottlenecks that limit throughput for large file streaming. This project vendors go-nfs with the following patches:
+
+**`conn.go` — concurrent request pipeline:**
+| Problem | Fix |
+|---------|-----|
+| Requests processed sequentially (READ N blocks READ N+1) | Goroutine-per-request with 32-slot semaphore |
+| `writeSerializer` channel buffer = 1 (pipeline stall) | Increased to 64 |
+| `bytes.Buffer` allocated per request (~2 MB, GC churn) | `sync.Pool` with pre-allocated 2 MB buffers |
+| `bufio.Reader/Writer` at default 4 KB | 1 MB reader, 2 MB writer |
+| Request body read from TCP stream (blocks next request) | Eagerly buffered into memory before dispatch |
+
+**`nfs_onread.go` — zero-copy read path:**
+| Problem | Fix |
+|---------|-----|
+| `make([]byte, count)` per READ (~12 MB/s GC churn at 100 Mbps) | `sync.Pool` for read buffers |
+| Intermediate `bytes.Buffer` + double copy of data | Direct write to response writer (1 copy instead of 3) |
+| Unnecessary `Stat()` before every large read (CheckRead) | Removed — `ReadAt` returns actual bytes read |
+| XDR struct encoding via reflection | Manual binary encoding for data payload |
+
 ### Why FD caching matters
 
 The `go-nfs` library opens and closes a file on **every** NFS `READ` RPC. For a 100 GB file read in 1 MB chunks, that's ~100,000 `open()/close()` cycles — each one a kernel roundtrip with path resolution and permission checks.
@@ -108,17 +134,37 @@ The `go-nfs` library opens and closes a file on **every** NFS `READ` RPC. For a 
 # Increase max open files
 ulimit -n 65536
 
-# TCP buffer auto-tuning
-sysctl -w net.core.rmem_max=8388608
-sysctl -w net.core.wmem_max=8388608
-sysctl -w net.ipv4.tcp_rmem="4096 1048576 8388608"
-sysctl -w net.ipv4.tcp_wmem="4096 1048576 8388608"
+# TCP buffer auto-tuning (critical for sustained throughput)
+sysctl -w net.core.rmem_max=16777216
+sysctl -w net.core.wmem_max=16777216
+sysctl -w net.ipv4.tcp_rmem="4096 1048576 16777216"
+sysctl -w net.ipv4.tcp_wmem="4096 1048576 16777216"
+sysctl -w net.ipv4.tcp_window_scaling=1
+sysctl -w net.core.netdev_max_backlog=5000
 ```
+
+### Linux client (mount options)
+
+```bash
+# Optimal mount for 4K streaming
+mount -t nfs -o port=2049,mountport=2049,nfsvers=3,noacl,tcp,\
+rsize=1048576,wsize=1048576,\
+noatime,nodiratime,\
+ac,acregmin=60,acregmax=120,\
+acdirmin=60,acdirmax=120 \
+<server>:/ /mnt/media
+```
+
+Key options:
+- `rsize=1048576` — 1 MB read size (vs default 32-64 KB)
+- `noatime,nodiratime` — skip access time updates
+- `acregmin/max=60/120` — cache file attributes 1-2 minutes (static media)
 
 ### Windows server
 
 - Ensure Windows Firewall allows inbound TCP on the chosen port
 - Run from an elevated (Administrator) command prompt if using port 2049
+- For best I/O: place media on NTFS volume (not ReFS), disable Windows Defender real-time scanning for the export directory
 
 ## Project Structure
 
@@ -129,7 +175,11 @@ sysctl -w net.ipv4.tcp_wmem="4096 1048576 8388608"
 ├── fsstat_unix.go       Disk stats via statfs() (Linux/macOS)
 ├── fsstat_windows.go    Disk stats via GetDiskFreeSpaceExW
 ├── go.mod
-└── go.sum
+├── go.sum
+└── vendor/              Vendored dependencies (patched go-nfs)
+    └── github.com/willscott/go-nfs/
+        ├── conn.go          ← patched: concurrency + buffer pools
+        └── nfs_onread.go    ← patched: zero-alloc read path
 ```
 
 ## License
