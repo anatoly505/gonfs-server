@@ -51,15 +51,15 @@ func onFSInfo(ctx context.Context, w *response, userHandle Handler) error {
 	}
 
 	res := fsinfores{
-		Rtmax:       1 << 30,
-		Rtpref:      1 << 30,
+		Rtmax:       MaxRead,
+		Rtpref:      1 << 20, // 1 MB — safe default; client rsize overrides
 		Rtmult:      4096,
-		Wtmax:       1 << 30,
-		Wtpref:      1 << 30,
+		Wtmax:       MaxRead,
+		Wtpref:      1 << 20,
 		Wtmult:      4096,
-		Dtpref:      8192,
-		Maxfilesize: 1 << 62, // wild guess. this seems big.
-		TimeDelta:   1,       // nanosecond precision.
+		Dtpref:      65536,
+		Maxfilesize: 1 << 62,
+		TimeDelta:   1,
 		Properties:  0,
 	}
 

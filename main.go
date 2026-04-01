@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -21,13 +22,15 @@ func main() {
 	port := flag.Int("port", 2049, "TCP port")
 	root := flag.String("root", ".", "Directory to export")
 	readOnly := flag.Bool("ro", true, "Read-only mode")
-	fdCache := flag.Int("fdcache", 256, "Open file descriptor cache size")
-	handleCache := flag.Int("hcache", 2048, "NFS handle cache size")
-	sendKB := flag.Int("sndbuf", 4096, "TCP send buffer size in KB")
-	recvKB := flag.Int("rcvbuf", 2048, "TCP receive buffer size in KB")
-	statSec := flag.Int("statttl", 5, "Stat cache TTL in seconds")
+	fdCache := flag.Int("fdcache", 1024, "Open file descriptor cache size")
+	handleCache := flag.Int("hcache", 4096, "NFS handle cache size")
+	sendKB := flag.Int("sndbuf", 16384, "TCP send buffer size in KB")
+	recvKB := flag.Int("rcvbuf", 8192, "TCP receive buffer size in KB")
+	statSec := flag.Int("statttl", 30, "Stat cache TTL in seconds")
+	gcPercent := flag.Int("gc", 400, "Go GC target percentage (higher = less GC, more RAM)")
 	flag.Parse()
 
+	debug.SetGCPercent(*gcPercent)
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	absRoot, err := filepath.Abs(*root)
@@ -49,36 +52,46 @@ func main() {
 	handler := NewFSHandler(cachedFS, absRoot, *readOnly)
 	cached := nfshelper.NewCachingHandler(handler, *handleCache)
 
-	log.Printf("NFS v3 server (streaming-optimized)")
+	log.Printf("=== gonfs-server ===")
 	log.Printf("  Export:       %s", absRoot)
 	log.Printf("  Listen:       :%d", *port)
 	log.Printf("  Read-only:    %v", *readOnly)
-	log.Printf("  FD cache:     %d entries", *fdCache)
-	log.Printf("  Handle cache: %d entries", *handleCache)
-	log.Printf("  TCP send buf: %d KB", *sendKB)
-	log.Printf("  TCP recv buf: %d KB", *recvKB)
+	log.Printf("  FD cache:     %d", *fdCache)
+	log.Printf("  Handle cache: %d", *handleCache)
+	log.Printf("  TCP sndbuf:   %d KB", *sendKB)
+	log.Printf("  TCP rcvbuf:   %d KB", *recvKB)
 	log.Printf("  Stat TTL:     %d s", *statSec)
+	log.Printf("  GOGC:         %d", *gcPercent)
 	log.Printf("  CPUs:         %d", runtime.NumCPU())
 	log.Printf("")
 	log.Printf("  Mount (Linux):")
-	log.Printf("  mount -t nfs -o port=%d,mountport=%d,nfsvers=3,noacl,tcp,rsize=1048576,wsize=1048576 <host>:/ <dir>", *port, *port)
+	log.Printf("    mount -t nfs -o port=%d,mountport=%d,nfsvers=3,noacl,tcp,rsize=1048576,wsize=1048576,noatime,nodiratime,actimeo=600 <host>:/ <dir>", *port, *port)
+	log.Printf("")
+	log.Printf("  Kernel tuning (run on server if Linux):")
+	log.Printf("    sysctl -w net.core.rmem_max=16777216")
+	log.Printf("    sysctl -w net.core.wmem_max=16777216")
 
+	done := make(chan struct{})
 	go func() {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-		<-ch
-		log.Println("Shutting down...")
+		sig := <-ch
+		log.Printf("Received %v, shutting down...", sig)
 		listener.Close()
-		os.Exit(0)
+		close(done)
 	}()
 
-	if err := nfs.Serve(listener, cached); err != nil {
-		log.Fatalf("Server error: %v", err)
+	err = nfs.Serve(listener, cached)
+	select {
+	case <-done:
+		log.Println("Clean shutdown.")
+	default:
+		if err != nil {
+			log.Fatalf("Server error: %v", err)
+		}
 	}
 }
 
-// tunedListener applies per-connection TCP optimizations critical for
-// sustained high-throughput streaming of large files.
 type tunedListener struct {
 	*net.TCPListener
 	sendBuf int

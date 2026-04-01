@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 
 	xdr2 "github.com/rasky/go-xdr/xdr2"
@@ -23,16 +24,12 @@ var responsePool = sync.Pool{
 }
 
 var (
-	// ErrInputInvalid is returned when input cannot be parsed
 	ErrInputInvalid = errors.New("invalid input")
-	// ErrAlreadySent is returned when writing a header/status multiple times
-	ErrAlreadySent = errors.New("response already started")
+	ErrAlreadySent  = errors.New("response already started")
 )
 
-// ResponseCode is a combination of accept_stat and reject_stat.
 type ResponseCode uint32
 
-// ResponseCode Codes
 const (
 	ResponseCodeSuccess ResponseCode = iota
 	ResponseCodeProgUnavailable
@@ -74,9 +71,6 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 
-		// Buffer the request body into memory so the TCP reader is free
-		// for the next request. NFS request bodies are small (~100 bytes
-		// for READ: handle + offset + count).
 		if lr, ok := w.req.Body.(*io.LimitedReader); ok && lr.N > 0 {
 			body := make([]byte, lr.N)
 			if _, err := io.ReadFull(lr, body); err != nil {
@@ -95,6 +89,13 @@ func (c *conn) serve(ctx context.Context) {
 		go func(w *response) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					buf := make([]byte, 4096)
+					n := runtime.Stack(buf, false)
+					Log.Errorf("panic in handler: %v\n%s", r, buf[:n])
+				}
+			}()
 
 			err := c.handle(connCtx, w)
 			respErr := w.finish(connCtx)
@@ -112,9 +113,33 @@ func (c *conn) serve(ctx context.Context) {
 	}
 }
 
+// serializeWrites drains completed responses and writes them to the TCP conn.
+// Key optimization: batch-flush. When multiple responses are ready (common
+// with concurrent handlers), they're all written into a single bufio buffer
+// before one Flush() syscall. This turns many small TCP writes into fewer
+// large ones, dramatically improving throughput for pipelined NFS clients.
 func (c *conn) serializeWrites(ctx context.Context) {
-	writer := bufio.NewWriterSize(c.Conn, 2<<20)
+	writer := bufio.NewWriterSize(c.Conn, 4<<20)
 	var fragmentBuf [4]byte
+
+	writeOne := func(buf *bytes.Buffer) bool {
+		msg := buf.Bytes()
+		binary.BigEndian.PutUint32(fragmentBuf[:], uint32(len(msg))|(1<<31))
+		if _, err := writer.Write(fragmentBuf[:]); err != nil {
+			buf.Reset()
+			responsePool.Put(buf)
+			return false
+		}
+		if _, err := writer.Write(msg); err != nil {
+			buf.Reset()
+			responsePool.Put(buf)
+			return false
+		}
+		buf.Reset()
+		responsePool.Put(buf)
+		return true
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -125,31 +150,34 @@ func (c *conn) serializeWrites(ctx context.Context) {
 				writer.Flush()
 				return
 			}
-			msg := buf.Bytes()
-			binary.BigEndian.PutUint32(fragmentBuf[:], uint32(len(msg))|(1<<31))
-			if _, err := writer.Write(fragmentBuf[:]); err != nil {
-				buf.Reset()
-				responsePool.Put(buf)
+			if !writeOne(buf) {
 				return
 			}
-			if _, err := writer.Write(msg); err != nil {
-				buf.Reset()
-				responsePool.Put(buf)
-				return
+
+			// Drain any immediately available responses before flushing.
+			drain := true
+			for drain {
+				select {
+				case buf2, ok2 := <-c.writeSerializer:
+					if !ok2 {
+						writer.Flush()
+						return
+					}
+					if !writeOne(buf2) {
+						return
+					}
+				default:
+					drain = false
+				}
 			}
+
 			if err := writer.Flush(); err != nil {
-				buf.Reset()
-				responsePool.Put(buf)
 				return
 			}
-			buf.Reset()
-			responsePool.Put(buf)
 		}
 	}
 }
 
-// Handle a request. errors from this method indicate a failure to read or
-// write on the network stream, and trigger a disconnection of the connection.
 func (c *conn) handle(ctx context.Context, w *response) error {
 	handler := c.Server.handlerFor(w.req.Header.Prog, w.req.Header.Proc)
 	if handler == nil {
@@ -258,7 +286,6 @@ func (w *response) writeHeader(code ResponseCode) error {
 	}
 
 	if status == rpc.MsgAccepted {
-		// Write opaque_auth header.
 		err = xdr.Write(w.writer, &rpc.AuthNull)
 		if err != nil {
 			return err
@@ -268,7 +295,6 @@ func (w *response) writeHeader(code ResponseCode) error {
 	return xdr.Write(w.writer, &code)
 }
 
-// Write a response to an xdr message
 func (w *response) Write(dat []byte) error {
 	if !w.responded {
 		if err := w.writeHeader(ResponseCodeSuccess); err != nil {
@@ -287,13 +313,11 @@ func (w *response) Write(dat []byte) error {
 	return nil
 }
 
-// drain reads the rest of the request frame if not consumed by the handler.
 func (w *response) drain(ctx context.Context) error {
 	if reader, ok := w.req.Body.(*io.LimitedReader); ok {
 		if reader.N == 0 {
 			return nil
 		}
-		// todo: wrap body in a context reader.
 		_, err := io.CopyN(io.Discard, w.req.Body, reader.N)
 		if err == nil || err == io.EOF {
 			return nil
@@ -343,7 +367,7 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 	if err != nil {
 		return nil, err
 	}
-	if reqType != 0 { // 0 = request, 1 = response
+	if reqType != 0 {
 		return nil, ErrInputInvalid
 	}
 
