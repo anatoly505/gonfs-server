@@ -17,8 +17,8 @@ import (
 // This layer keeps FDs open in an LRU cache, eliminating that overhead.
 //
 // Thread safety: ReadAt uses pread(2) which is safe for concurrent use.
-// Eviction uses reference counting — a file is only closed when both
-// evicted from cache AND all active readers have released it.
+// Eviction uses reference counting + sync.Once — a file is only closed
+// once, even if eviction and last-reader release race.
 type CachedFS struct {
 	billy.Filesystem
 	fdCache   *lru.Cache[string, *cachedFD]
@@ -28,9 +28,16 @@ type CachedFS struct {
 }
 
 type cachedFD struct {
-	file    billy.File
-	refs    int64
-	evicted int32
+	file      billy.File
+	refs      int64
+	evicted   int32
+	closeOnce sync.Once
+}
+
+func (fd *cachedFD) closeFile() {
+	fd.closeOnce.Do(func() {
+		fd.file.Close()
+	})
 }
 
 type statEntry struct {
@@ -42,7 +49,7 @@ func NewCachedFS(inner billy.Filesystem, fdCacheSize int, statTTL time.Duration)
 	fdCache, _ := lru.NewWithEvict(fdCacheSize, func(_ string, fd *cachedFD) {
 		atomic.StoreInt32(&fd.evicted, 1)
 		if atomic.LoadInt64(&fd.refs) == 0 {
-			fd.file.Close()
+			fd.closeFile()
 		}
 	})
 	statCache, _ := lru.New[string, *statEntry](fdCacheSize * 4)
@@ -78,26 +85,52 @@ func (c *CachedFS) Open(filename string) (billy.File, error) {
 	return &fileRef{fd: fd}, nil
 }
 
-func (c *CachedFS) Stat(filename string) (os.FileInfo, error) {
-	if se, ok := c.statCache.Get(filename); ok {
-		if time.Since(se.fetched) < c.statTTL {
-			return se.info, nil
-		}
+func (c *CachedFS) statLookup(filename string) (os.FileInfo, bool) {
+	se, ok := c.statCache.Get(filename)
+	if !ok {
+		return nil, false
 	}
+	if time.Since(se.fetched) >= c.statTTL {
+		return nil, false
+	}
+	return se.info, true
+}
 
+func (c *CachedFS) statStore(filename string, info os.FileInfo) {
+	c.statCache.Add(filename, &statEntry{info: info, fetched: time.Now()})
+}
+
+func (c *CachedFS) Stat(filename string) (os.FileInfo, error) {
+	if info, ok := c.statLookup(filename); ok {
+		return info, nil
+	}
 	info, err := c.Filesystem.Stat(filename)
 	if err != nil {
 		return nil, err
 	}
+	c.statStore(filename, info)
+	return info, nil
+}
 
-	c.statCache.Add(filename, &statEntry{info: info, fetched: time.Now()})
+// Lstat is called by go-nfs tryStat() on every READ response and
+// by onGetAttr(). Without this override, every call bypasses our
+// cache and hits the OS — a syscall per NFS READ, devastating throughput.
+func (c *CachedFS) Lstat(filename string) (os.FileInfo, error) {
+	if info, ok := c.statLookup(filename); ok {
+		return info, nil
+	}
+	info, err := c.Filesystem.Lstat(filename)
+	if err != nil {
+		return nil, err
+	}
+	c.statStore(filename, info)
 	return info, nil
 }
 
 // fileRef wraps a cached FD. ReadAt delegates to pread(2) — thread-safe,
 // no locking needed for concurrent reads to the same file.
-// Close decrements refcount; actual file close happens only when
-// both evicted from cache AND refcount reaches zero.
+// Close decrements refcount; actual file close uses sync.Once to prevent
+// the double-close race between eviction and last-reader release.
 type fileRef struct {
 	fd *cachedFD
 }
@@ -113,7 +146,7 @@ func (f *fileRef) Unlock() error                             { return f.fd.file.
 
 func (f *fileRef) Close() error {
 	if atomic.AddInt64(&f.fd.refs, -1) == 0 && atomic.LoadInt32(&f.fd.evicted) == 1 {
-		return f.fd.file.Close()
+		f.fd.closeFile()
 	}
 	return nil
 }

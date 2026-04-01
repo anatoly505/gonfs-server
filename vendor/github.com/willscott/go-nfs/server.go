@@ -89,15 +89,8 @@ func (s *Server) newConn(nc net.Conn) *conn {
 	return c
 }
 
-// TODO: keep an immutable map for each server instance to have less
-// chance of races.
 func (s *Server) handlerFor(prog uint32, proc uint32) HandleFunc {
-	for k, v := range registeredHandlers {
-		if k.protocol == prog && k.proc == proc {
-			return v
-		}
-	}
-	return nil
+	return registeredHandlers[registeredHandlerID{prog, proc}]
 }
 
 // Serve is a singleton listener paralleling http.Serve

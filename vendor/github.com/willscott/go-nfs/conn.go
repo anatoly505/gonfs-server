@@ -89,35 +89,35 @@ func (c *conn) serve(ctx context.Context) {
 		go func(w *response) {
 			defer wg.Done()
 			defer func() { <-sem }()
+
+			finished := false
 			defer func() {
 				if r := recover(); r != nil {
 					buf := make([]byte, 4096)
 					n := runtime.Stack(buf, false)
 					Log.Errorf("panic in handler: %v\n%s", r, buf[:n])
 				}
+				if !finished {
+					w.writer.Reset()
+					responsePool.Put(w.writer)
+				}
 			}()
 
-			err := c.handle(connCtx, w)
-			respErr := w.finish(connCtx)
-			if err != nil {
-				Log.Errorf("error handling req: %v", err)
+			c.handle(connCtx, w)
+
+			if err := w.finish(connCtx); err != nil {
+				Log.Errorf("finish error: %v", err)
 				cancel()
 				return
 			}
-			if respErr != nil {
-				Log.Errorf("error sending response: %v", respErr)
-				cancel()
-				return
-			}
+			finished = true
 		}(w)
 	}
 }
 
 // serializeWrites drains completed responses and writes them to the TCP conn.
-// Key optimization: batch-flush. When multiple responses are ready (common
-// with concurrent handlers), they're all written into a single bufio buffer
-// before one Flush() syscall. This turns many small TCP writes into fewer
-// large ones, dramatically improving throughput for pipelined NFS clients.
+// Batch-flush: when multiple responses are ready, they're all written into
+// a single bufio buffer before one Flush() syscall.
 func (c *conn) serializeWrites(ctx context.Context) {
 	writer := bufio.NewWriterSize(c.Conn, 4<<20)
 	var fragmentBuf [4]byte
@@ -154,7 +154,6 @@ func (c *conn) serializeWrites(ctx context.Context) {
 				return
 			}
 
-			// Drain any immediately available responses before flushing.
 			drain := true
 			for drain {
 				select {
