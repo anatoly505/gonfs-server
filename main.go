@@ -28,7 +28,12 @@ func main() {
 	recvKB := flag.Int("rcvbuf", 8192, "TCP receive buffer size in KB")
 	statSec := flag.Int("statttl", 30, "Stat cache TTL in seconds")
 	gcPercent := flag.Int("gc", 400, "Go GC target percentage (higher = less GC, more RAM)")
+	logLevel := flag.String("log", "info", "Log level: error, warn, info, debug, trace")
 	flag.Parse()
+
+	if lvl, err := nfs.Log.ParseLevel(*logLevel); err == nil {
+		nfs.Log.SetLevel(lvl)
+	}
 
 	debug.SetGCPercent(*gcPercent)
 	runtime.GOMAXPROCS(runtime.NumCPU())

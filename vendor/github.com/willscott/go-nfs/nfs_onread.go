@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
@@ -40,12 +42,44 @@ func putReadBuf(b []byte) {
 	readBufPool.Put(&b)
 }
 
+// Throughput diagnostics — atomic counters, zero overhead when not read.
+var (
+	readStatOps   uint64
+	readStatBytes uint64
+	readStatFirst sync.Once
+	readStatOnce  sync.Once
+)
+
+func startReadStats() {
+	readStatOnce.Do(func() {
+		go func() {
+			for range time.Tick(5 * time.Second) {
+				ops := atomic.SwapUint64(&readStatOps, 0)
+				bytes := atomic.SwapUint64(&readStatBytes, 0)
+				if ops > 0 {
+					avgKB := bytes / ops / 1024
+					mbps := float64(bytes) * 8 / 5 / 1_000_000
+					Log.Infof("READ stats (5s): %d ops, avg %d KB/op, %.1f Mbps",
+						ops, avgKB, mbps)
+				}
+			}
+		}()
+	})
+}
+
 func onRead(ctx context.Context, w *response, userHandle Handler) error {
 	w.errorFmt = opAttrErrorFormatter
 	var obj nfsReadArgs
 	if err := xdr.Read(w.req.Body, &obj); err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
+
+	startReadStats()
+
+	readStatFirst.Do(func() {
+		Log.Infof(">>> Client rsize detected: %d bytes (%d KB). If this is small (<= 32 KB), throughput will be terrible. Client must mount with rsize=1048576.",
+			obj.Count, obj.Count/1024)
+	})
 
 	fs, path, err := userHandle.FromHandle(obj.Handle)
 	if err != nil {
@@ -73,13 +107,14 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusIO, readErr}
 	}
 
+	atomic.AddUint64(&readStatOps, 1)
+	atomic.AddUint64(&readStatBytes, uint64(cnt))
+
 	var eof uint32
 	if errors.Is(readErr, io.EOF) {
 		eof = 1
 	}
 
-	// All I/O complete — build response directly into the response writer,
-	// eliminating the intermediate bytes.Buffer and one full data copy.
 	if err := w.writeHeader(ResponseCodeSuccess); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
